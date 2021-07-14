@@ -1,5 +1,8 @@
 // @flow
 
+import { batch } from 'react-redux';
+
+import { ENDPOINT_REACTION_NAME } from '../../../modules/API/constants';
 import { APP_WILL_MOUNT, APP_WILL_UNMOUNT } from '../base/app';
 import {
     CONFERENCE_JOINED,
@@ -18,11 +21,23 @@ import {
 } from '../base/participants';
 import { MiddlewareRegistry, StateListenerRegistry } from '../base/redux';
 import { playSound, registerSound, unregisterSound } from '../base/sounds';
+import { openDisplayNamePrompt } from '../display-name';
+import { ADD_REACTIONS_MESSAGE } from '../reactions/actionTypes';
+import {
+    pushReaction
+} from '../reactions/actions.any';
+import { REACTIONS } from '../reactions/constants';
+import { endpointMessageReceived } from '../subtitles';
 import { showToolbox } from '../toolbox/actions';
-import { isButtonEnabled } from '../toolbox/functions';
+import {
+    hideToolbox,
+    setToolboxTimeout,
+    setToolboxVisible
+} from '../toolbox/actions.web';
 
-import { SEND_MESSAGE, SET_PRIVATE_MESSAGE_RECIPIENT } from './actionTypes';
-import { addMessage, clearMessages, toggleChat } from './actions';
+import { ADD_MESSAGE, SEND_MESSAGE, OPEN_CHAT, CLOSE_CHAT } from './actionTypes';
+import { addMessage, clearMessages } from './actions';
+import { closeChat } from './actions.any';
 import { ChatPrivacyDialog } from './components';
 import {
     CHAT_VIEW_MODAL_ID,
@@ -31,6 +46,7 @@ import {
     MESSAGE_TYPE_LOCAL,
     MESSAGE_TYPE_REMOTE
 } from './constants';
+import { getUnreadCount } from './functions';
 import { INCOMING_MSG_SOUND_FILE } from './sounds';
 
 declare var APP: Object;
@@ -51,9 +67,20 @@ const PRIVACY_NOTICE_TIMEOUT = 20 * 1000;
  * @returns {Function}
  */
 MiddlewareRegistry.register(store => next => action => {
-    const { dispatch } = store;
+    const { dispatch, getState } = store;
+    const localParticipant = getLocalParticipant(getState());
+    let isOpen, unreadCount;
 
     switch (action.type) {
+    case ADD_MESSAGE:
+        unreadCount = action.hasRead ? 0 : getUnreadCount(getState()) + 1;
+        isOpen = getState()['features/chat'].isOpen;
+
+        if (typeof APP !== 'undefined') {
+            APP.API.notifyChatUpdated(unreadCount, isOpen);
+        }
+        break;
+
     case APP_WILL_MOUNT:
         dispatch(
                 registerSound(INCOMING_MSG_SOUND_ID, INCOMING_MSG_SOUND_FILE));
@@ -65,6 +92,36 @@ MiddlewareRegistry.register(store => next => action => {
 
     case CONFERENCE_JOINED:
         _addChatMsgListener(action.conference, store);
+        break;
+
+    case OPEN_CHAT:
+        if (navigator.product === 'ReactNative') {
+            if (localParticipant.name) {
+                dispatch(setActiveModalId(CHAT_VIEW_MODAL_ID));
+            } else {
+                dispatch(openDisplayNamePrompt(() => {
+                    dispatch(setActiveModalId(CHAT_VIEW_MODAL_ID));
+                }));
+            }
+        } else {
+            dispatch(setActiveModalId(CHAT_VIEW_MODAL_ID));
+        }
+
+        unreadCount = 0;
+
+        if (typeof APP !== 'undefined') {
+            APP.API.notifyChatUpdated(unreadCount, true);
+        }
+        break;
+
+    case CLOSE_CHAT:
+        unreadCount = 0;
+
+        if (typeof APP !== 'undefined') {
+            APP.API.notifyChatUpdated(unreadCount, false);
+        }
+
+        dispatch(setActiveModalId());
         break;
 
     case SEND_MESSAGE: {
@@ -101,10 +158,13 @@ MiddlewareRegistry.register(store => next => action => {
         break;
     }
 
-    case SET_PRIVATE_MESSAGE_RECIPIENT: {
-        Boolean(action.participant) && dispatch(setActiveModalId(CHAT_VIEW_MODAL_ID));
-        _maybeFocusField();
-        break;
+    case ADD_REACTIONS_MESSAGE: {
+        _handleReceivedMessage(store, {
+            id: localParticipant.id,
+            message: action.message,
+            privateMessage: false,
+            timestamp: Date.now()
+        });
     }
     }
 
@@ -124,7 +184,7 @@ StateListenerRegistry.register(
 
             if (getState()['features/chat'].isOpen) {
                 // Closes the chat if it's left open.
-                dispatch(toggleChat());
+                dispatch(closeChat());
             }
 
             // Clear chat messages.
@@ -152,10 +212,10 @@ StateListenerRegistry.register(
  * @returns {void}
  */
 function _addChatMsgListener(conference, store) {
-    if ((typeof APP !== 'undefined' && !isButtonEnabled('chat'))
-        || store.getState()['features/base/config'].iAmRecorder) {
-        // We don't register anything on web if the chat button is not enabled in interfaceConfig
-        // or we are in iAmRecorder mode
+    const reactions = {};
+
+    if (store.getState()['features/base/config'].iAmRecorder) {
+        // We don't register anything on web if we are in iAmRecorder mode
         return;
     }
 
@@ -182,6 +242,43 @@ function _addChatMsgListener(conference, store) {
             });
         }
     );
+
+    conference.on(
+        JitsiConferenceEvents.ENDPOINT_MESSAGE_RECEIVED,
+        (...args) => {
+            store.dispatch(endpointMessageReceived(...args));
+
+            if (args && args.length >= 2) {
+                const [ { _id }, eventData ] = args;
+
+                if (eventData.name === ENDPOINT_REACTION_NAME) {
+                    reactions[_id] = reactions[_id] ?? {
+                        timeout: null,
+                        message: ''
+                    };
+                    batch(() => {
+                        store.dispatch(pushReaction(eventData.reaction));
+                        store.dispatch(setToolboxVisible(true));
+                        store.dispatch(setToolboxTimeout(
+                                () => store.dispatch(hideToolbox()),
+                                5000)
+                        );
+                    });
+
+                    clearTimeout(reactions[_id].timeout);
+                    reactions[_id].message = `${reactions[_id].message}${REACTIONS[eventData.reaction].message}`;
+                    reactions[_id].timeout = setTimeout(() => {
+                        _handleReceivedMessage(store, {
+                            id: _id,
+                            message: reactions[_id].message,
+                            privateMessage: false,
+                            timestamp: eventData.timestamp
+                        });
+                        delete reactions[_id];
+                    }, 500);
+                }
+            }
+        });
 
     conference.on(
         JitsiConferenceEvents.CONFERENCE_ERROR, (errorType, error) => {
@@ -249,23 +346,11 @@ function _handleReceivedMessage({ dispatch, getState }, { id, message, privateMe
             body: message,
             id,
             nick: displayName,
+            privateMessage,
             ts: timestamp
         });
 
         dispatch(showToolbox(4000));
-    }
-}
-
-/**
- * Focuses the chat text field on web after the message recipient was updated, if needed.
- *
- * @returns {void}
- */
-function _maybeFocusField() {
-    if (navigator.product !== 'ReactNative') {
-        const textField = document.getElementById('usermsg');
-
-        textField && textField.focus();
     }
 }
 

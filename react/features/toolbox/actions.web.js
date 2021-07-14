@@ -4,7 +4,8 @@ import type { Dispatch } from 'redux';
 
 import {
     FULL_SCREEN_CHANGED,
-    SET_FULL_SCREEN
+    SET_FULL_SCREEN,
+    SET_OVERFLOW_DRAWER
 } from './actionTypes';
 import {
     clearToolboxTimeout,
@@ -82,10 +83,13 @@ export function hideToolbox(force: boolean = false): Function {
 
         dispatch(clearToolboxTimeout());
 
+        const focusSelector = '.toolbox-content-items:focus-within,.filmstrip:focus-within,.remotevideomenu:hover';
+
         if (!force
                 && (hovered
                     || state['features/invite'].calleeInfoVisible
-                    || state['features/chat'].isOpen)) {
+                    || state['features/chat'].isOpen
+                    || document.querySelector(focusSelector))) {
             dispatch(
                 setToolboxTimeout(
                     () => dispatch(hideToolbox()),
@@ -141,5 +145,21 @@ export function showToolbox(timeout: number = 0): Object {
                 dispatch(setToolboxTimeoutMS(interfaceConfig.TOOLBAR_TIMEOUT));
             }
         }
+    };
+}
+
+/**
+ * Signals a request to display overflow as drawer.
+ *
+ * @param {boolean} displayAsDrawer - True to display overflow as drawer, false to preserve original behaviour.
+ * @returns {{
+ *     type: SET_OVERFLOW_DRAWER,
+ *     displayAsDrawer: boolean
+ * }}
+ */
+export function setOverflowDrawer(displayAsDrawer: boolean) {
+    return {
+        type: SET_OVERFLOW_DRAWER,
+        displayAsDrawer
     };
 }
